@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install)",
+      "Bash(node:*)",
+      "Bash(taskkill:*)",
+      "Bash(pkill:*)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(powershell -Command \"Stop-Process -Id 9496 -Force\")",
+      "Bash(powershell -Command:*)",
+      "Bash(curl:*)",
+      "Bash(if exist databaseaccounting.db del databaseaccounting.db)",
+      "Bash(python -c:*)"
+    ]
+  }
+}

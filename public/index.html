@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>نظام ERP محاسبي كامل</title>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="app-container">
+  <header class="app-header">
+    <div class="header-content">
+      <h1>🏭 نظام ERP محاسبي</h1>
+      <div class="header-info">
+        <span class="badge badge-success">🟢 متصل</span>
+        <span id="currentUser">Admin</span>
+      </div>
+    </div>
+  </header>
+
+  <aside class="sidebar">
+    <nav class="nav-menu">
+      <div class="nav-section">
+        <h3>📊 الرئيسية</h3>
+        <a href="#" class="nav-item active" data-page="dashboard">
+          <span>📈</span> لوحة التحكم
+        </a>
+      </div>
+
+      <div class="nav-section">
+        <h3>🎨 الإعدادات الأساسية</h3>
+        <a href="#" class="nav-item" data-page="color-codes">
+          <span>🎨</span> أكواد الألوان
+        </a>
+        <a href="#" class="nav-item" data-page="warehouses">
+          <span>🏬</span> المخازن
+        </a>
+        <a href="#" class="nav-item" data-page="product-types">
+          <span>📦</span> أنواع المنتجات
+        </a>
+        <a href="#" class="nav-item" data-page="service-types">
+          <span>⚙️</span> أنواع الخدمات
+        </a>
+      </div>
+
+      <div class="nav-section">
+        <h3>📦 المخزون</h3>
+        <a href="#" class="nav-item" data-page="inventory">
+          <span>📦</span> المخزون
+        </a>
+      </div>
+
+      <div class="nav-section">
+        <h3>🏭 التصنيع والإنتاج</h3>
+        <a href="#" class="nav-item" data-page="tdwar">
+          <span>🔄</span> نظام التدوير
+        </a>
+        <a href="#" class="nav-item" data-page="artisans">
+          <span>👨‍🔧</span> الصنّاع
+        </a>
+        <a href="#" class="nav-item" data-page="artisan-dashboard">
+          <span>📊</span> أداء الصناع
+        </a>
+      </div>
+
+      <div class="nav-section">
+        <h3>💰 المبيعات والمشتريات</h3>
+        <a href="#" class="nav-item" data-page="pos">
+          <span>🛒</span> نقطة البيع
+        </a>
+        <a href="#" class="nav-item" data-page="special-orders">
+          <span>📋</span> الطلبيات الخاصة
+        </a>
+        <a href="#" class="nav-item" data-page="sales">
+          <span>📤</span> المبيعات
+        </a>
+        <a href="#" class="nav-item" data-page="purchases">
+          <span>📥</span> المشتريات
+        </a>
+      </div>
+
+      <div class="nav-section">
+        <h3>📝 الشيكات</h3>
+        <a href="#" class="nav-item" data-page="checks-portfolio">
+          <span>💳</span> محفظة الشيكات
+        </a>
+        <a href="#" class="nav-item" data-page="checks-issued">
+          <span>📄</span> الشيكات الصادرة
+        </a>
+      </div>
+
+      <div class="nav-section">
+        <h3>💵 المالية</h3>
+        <a href="#" class="nav-item" data-page="treasury">
+          <span>💰</span> الخزينة
+        </a>
+        <a href="#" class="nav-item" data-page="expenses">
+          <span>💸</span> المصروفات
+        </a>
+        <a href="#" class="nav-item" data-page="clients">
+          <span>👥</span> العملاء
+        </a>
+        <a href="#" class="nav-item" data-page="suppliers">
+          <span>🏭</span> الموردين
+        </a>
+      </div>
+
+      <div class="nav-section">
+        <h3>📊 التقارير</h3>
+        <a href="#" class="nav-item" data-page="reports">
+          <span>📈</span> التقارير المالية
+        </a>
+      </div>
+    </nav>
+  </aside>
+
+  <main class="main-content">
+    <div id="page-container"></div>
+  </main>
+</div>
+
+<div id="modal-container"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

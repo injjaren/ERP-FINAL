@@ -1,0 +1,14 @@
+services:
+  erp-accounting:
+    build: .
+    container_name: erp-accounting-system
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./database:/app/database
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    restart: unless-stopped
