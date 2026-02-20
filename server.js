@@ -515,6 +515,47 @@ CREATE TABLE IF NOT EXISTS profit_distributions (
 );
 
 INSERT OR IGNORE INTO opening_balances (id, cash, bank, fiscal_year) VALUES (1, 0, 0, 2026);
+
+-- ARTISAN SERVICE RATES (time-versioned, append-only)
+CREATE TABLE IF NOT EXISTS artisan_service_rates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  artisan_id INTEGER NOT NULL,
+  service_type_id INTEGER NOT NULL,
+  rate REAL NOT NULL,
+  effective_from DATE NOT NULL DEFAULT CURRENT_DATE,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(artisan_id) REFERENCES artisans(id),
+  FOREIGN KEY(service_type_id) REFERENCES service_types(id),
+  UNIQUE(artisan_id, service_type_id, effective_from)
+);
+
+-- INVOICE REVISION SYSTEM
+CREATE TABLE IF NOT EXISTS invoice_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_id INTEGER NOT NULL,
+  revision_number INTEGER NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  reason TEXT,
+  created_by TEXT,
+  FOREIGN KEY(invoice_id) REFERENCES sales(id)
+);
+
+CREATE TABLE IF NOT EXISTS invoice_revision_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  revision_id INTEGER NOT NULL,
+  service_type_id INTEGER,
+  quantity REAL,
+  unit_price REAL,
+  artisan_id INTEGER,
+  status TEXT DEFAULT 'Draft',
+  notes TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(revision_id) REFERENCES invoice_revisions(id),
+  FOREIGN KEY(service_type_id) REFERENCES service_types(id),
+  FOREIGN KEY(artisan_id) REFERENCES artisans(id),
+  -- Enforce: one row per (revision, service, artisan) combination
+  UNIQUE(revision_id, COALESCE(service_type_id, 0), COALESCE(artisan_id, 0))
+);
 `;
 
 db.exec(schema);
@@ -589,6 +630,168 @@ try {
   }
 } catch (migrationErr) {
   console.error('[MIGRATION WARNING] Inventory dedup migration:', migrationErr.message);
+}
+
+// ============================================
+// MIGRATION: Add artisan_type column to artisans
+// ============================================
+try {
+  const artisanCols = db.prepare("PRAGMA table_info(artisans)").all().map(c => c.name);
+  if (!artisanCols.includes('artisan_type')) {
+    db.exec(`ALTER TABLE artisans ADD COLUMN artisan_type TEXT DEFAULT 'SERVICE'`);
+    // Mark known SABRA/packing artisans — we detect them by craft_type containing SABRA/packing keywords
+    db.prepare(`
+      UPDATE artisans SET artisan_type = 'SABRA_PACKING'
+      WHERE UPPER(craft_type) LIKE '%SABRA%'
+         OR UPPER(craft_type) LIKE '%PACK%'
+         OR UPPER(name) LIKE '%SABRA%'
+    `).run();
+    console.log('[MIGRATION] Added artisan_type column to artisans');
+  }
+} catch (artisanTypeMigErr) {
+  console.error('[MIGRATION WARNING] artisan_type migration:', artisanTypeMigErr.message);
+}
+
+// ============================================
+// MIGRATION: Add invoice_status column to sales
+// ============================================
+try {
+  const salesCols = db.prepare("PRAGMA table_info(sales)").all().map(c => c.name);
+  if (!salesCols.includes('invoice_status')) {
+    db.exec(`ALTER TABLE sales ADD COLUMN invoice_status TEXT DEFAULT 'Completed'`);
+    // Existing sales are already completed
+    db.prepare(`UPDATE sales SET invoice_status = 'Completed' WHERE invoice_status IS NULL`).run();
+    console.log('[MIGRATION] Added invoice_status column to sales');
+  }
+} catch (invoiceStatusErr) {
+  console.error('[MIGRATION WARNING] invoice_status migration:', invoiceStatusErr.message);
+}
+
+// ============================================
+// MIGRATION: Add deposit_amount column to sales
+// ============================================
+try {
+  const salesCols2 = db.prepare("PRAGMA table_info(sales)").all().map(c => c.name);
+  if (!salesCols2.includes('deposit_amount')) {
+    db.exec(`ALTER TABLE sales ADD COLUMN deposit_amount REAL DEFAULT 0`);
+    console.log('[MIGRATION] Added deposit_amount column to sales');
+  }
+} catch (depositMigErr) {
+  console.error('[MIGRATION WARNING] deposit_amount migration:', depositMigErr.message);
+}
+
+// ============================================
+// MIGRATION: Add artisan_rate column to invoice_revision_items
+// Stores the frozen artisan cost-rate at the moment a revision item is created.
+// DEFAULT 0 so all existing rows read as zero-cost (safe: they predate this feature).
+// ============================================
+try {
+  const iriCols = db.prepare("PRAGMA table_info(invoice_revision_items)").all().map(c => c.name);
+  if (!iriCols.includes('artisan_rate')) {
+    db.exec(`ALTER TABLE invoice_revision_items ADD COLUMN artisan_rate REAL DEFAULT 0`);
+    console.log('[MIGRATION] Added artisan_rate column to invoice_revision_items');
+  }
+} catch (artisanRateMigErr) {
+  console.error('[MIGRATION WARNING] artisan_rate column migration:', artisanRateMigErr.message);
+}
+
+// ============================================
+// MIGRATION: Seed artisan_service_rates from existing artisan_services rows
+// artisan_services already has (artisan_id, service_type_id, rate).
+// We copy each distinct pair as an initial rate row with effective_from = '2000-01-01'
+// so it acts as an eternal baseline that real dated rows will supersede.
+// INSERT OR IGNORE prevents duplicate violations on re-runs.
+// ============================================
+try {
+  db.prepare(`
+    INSERT OR IGNORE INTO artisan_service_rates (artisan_id, service_type_id, rate, effective_from)
+    SELECT artisan_id, service_type_id, rate, '2000-01-01'
+    FROM artisan_services
+    WHERE rate IS NOT NULL
+  `).run();
+  console.log('[MIGRATION] Seeded artisan_service_rates from artisan_services');
+} catch (seedRatesMigErr) {
+  console.error('[MIGRATION WARNING] artisan_service_rates seed migration:', seedRatesMigErr.message);
+}
+
+// ============================================
+// MIGRATION: Backfill revision 1 for every sale that has no revisions yet
+// Idempotent: skips any sale that already has at least one revision row.
+// Copies sales_items into invoice_revision_items with:
+//   service_type_id = NULL  (sales_items are product lines, not service lines)
+//   artisan_id      = NULL
+//   quantity / unit_price copied directly
+//   status          = 'Completed'  (original sale is already done)
+// ============================================
+try {
+  const backfillTx = db.transaction(() => {
+    // Find all sales that have no entry in invoice_revisions
+    const unbackfilled = db.prepare(`
+      SELECT s.id, s.date, s.created_by
+      FROM sales s
+      WHERE NOT EXISTS (
+        SELECT 1 FROM invoice_revisions r WHERE r.invoice_id = s.id
+      )
+      -- Only backfill real sales (exclude credit_notes and adjustments which should not have revisions)
+      AND s.status NOT IN ('credit_note', 'adjustment')
+    `).all();
+
+    const insertRev = db.prepare(`
+      INSERT INTO invoice_revisions (invoice_id, revision_number, reason, created_by, created_at)
+      VALUES (?, 1, 'النسخة الأصلية من الفاتورة (ترحيل تلقائي)', ?, ?)
+    `);
+    const insertRevItem = db.prepare(`
+      INSERT OR IGNORE INTO invoice_revision_items
+        (revision_id, service_type_id, quantity, unit_price, artisan_id, status, notes)
+      VALUES (?, ?, ?, ?, NULL, 'Completed', ?)
+    `);
+
+    let salesBackfilled = 0;
+    let itemsBackfilled = 0;
+
+    for (const sale of unbackfilled) {
+      // Create revision 1
+      const revResult = insertRev.run(
+        sale.id,
+        sale.created_by || 'system',
+        sale.date || new Date().toISOString()
+      );
+      const revId = revResult.lastInsertRowid;
+
+      // Copy sales_items for this sale
+      // service_type_id: use the special_order.service_type_id if it is a special-order item,
+      // otherwise NULL — product sales have no service type.
+      const saleItems = db.prepare(`
+        SELECT si.quantity, si.unit_price, si.product_name,
+               si.is_special_order, so.service_type_id
+        FROM sales_items si
+        LEFT JOIN special_orders so ON si.special_order_id = so.id
+        WHERE si.sale_id = ?
+      `).all(sale.id);
+
+      for (const si of saleItems) {
+        insertRevItem.run(
+          revId,
+          si.service_type_id || null,   // only populated for special-order service items
+          si.quantity,
+          si.unit_price,
+          si.product_name               // stored as notes so product identity is not lost
+        );
+        itemsBackfilled++;
+      }
+
+      salesBackfilled++;
+    }
+
+    return { salesBackfilled, itemsBackfilled };
+  });
+
+  const backfillResult = backfillTx();
+  if (backfillResult.salesBackfilled > 0) {
+    console.log(`[MIGRATION] Backfilled revision 1 for ${backfillResult.salesBackfilled} sales (${backfillResult.itemsBackfilled} items)`);
+  }
+} catch (backfillErr) {
+  console.error('[MIGRATION WARNING] Revision 1 backfill:', backfillErr.message);
 }
 
 // Middleware
@@ -2079,6 +2282,20 @@ app.get('/api/sales', (req, res) => {
       ORDER BY s.date DESC
     `).all(...params);
 
+    // Prepare a single statement used for every sale's latest revision lookup.
+    // Fetches artisan_rate (frozen cost) alongside unit_price (sale price) and artisan_id.
+    const stmtLatestRev = db.prepare(`
+      SELECT iri.quantity, iri.unit_price, iri.artisan_id,
+             iri.artisan_rate, iri.service_type_id
+      FROM invoice_revision_items iri
+      WHERE iri.revision_id = (
+        SELECT id FROM invoice_revisions
+        WHERE invoice_id = ?
+        ORDER BY revision_number DESC
+        LIMIT 1
+      )
+    `);
+
     // Get items and payments for each sale
     sales.forEach(sale => {
       sale.items = db.prepare(`
@@ -2090,13 +2307,40 @@ app.get('/api/sales', (req, res) => {
 
       sale.payments = db.prepare(`SELECT * FROM sales_payments WHERE sale_id = ?`).all(sale.id);
 
-      // Calculate totals
+      // total_paid includes all payment types: نقدي, شيك, تحويل, TPE, آجل, أرابون
       sale.total_paid = sale.payments.reduce((sum, p) => sum + parseFloat(p.amount || 0), 0);
-      sale.remaining = sale.final_amount - sale.total_paid;
+      sale.remaining  = parseFloat(sale.final_amount || 0) - sale.total_paid;
 
-      // Calculate cost and profit
-      sale.total_cost = sale.items.reduce((sum, item) => sum + (parseFloat(item.unit_cost || 0) * parseFloat(item.quantity || 0)), 0);
-      sale.profit = sale.final_amount - sale.total_cost;
+      // ── Profit calculation ──────────────────────────────────────────────
+      // Revenue = sale.final_amount  (what the client pays, kept current by revision endpoint)
+      // Cost    = SUM(quantity × artisan_rate) for service items (artisan_id IS NOT NULL)
+      //           artisan_rate is the FROZEN rate stored at revision creation time.
+      //           unit_price is the SALE PRICE — it is NOT used in cost calculation.
+      //
+      // For product items (artisan_id NULL, inventory_id present), cost comes from
+      // inventory.unit_cost via sales_items — only in the legacy fallback path.
+      // We do NOT double-count: service items never touch inventory.
+      const revItems = stmtLatestRev.all(sale.id);
+
+      if (revItems.length > 0) {
+        // Revision path: cost = SUM(quantity × artisan_rate) for items with an artisan.
+        // artisan_rate = 0 for backfilled historical items (safe default, no retroactive change).
+        sale.total_cost = revItems.reduce((sum, ri) => {
+          if (ri.artisan_id) {
+            return sum + (parseFloat(ri.quantity || 0) * parseFloat(ri.artisan_rate || 0));
+          }
+          return sum;
+        }, 0);
+        sale.profit        = parseFloat(sale.final_amount || 0) - sale.total_cost;
+        sale.profit_source = 'revision';
+      } else {
+        // Legacy fallback — no revisions exist at all (should not happen after backfill migration,
+        // but kept as a safe guard for any edge-case sales created after a server crash mid-migration).
+        sale.total_cost = sale.items.reduce((sum, item) =>
+          sum + (parseFloat(item.unit_cost || 0) * parseFloat(item.quantity || 0)), 0);
+        sale.profit        = parseFloat(sale.final_amount || 0) - sale.total_cost;
+        sale.profit_source = 'sales_items';
+      }
     });
 
     // Calculate payment breakdown for each sale
@@ -2653,15 +2897,73 @@ app.get('/api/reports/balance-sheet', (req, res) => {
 app.get('/api/reports/income-statement', (req, res) => {
   try {
     const { year } = req.query;
-    const salesData = db.prepare('SELECT SUM(subtotal) as gross, SUM(discount_amount) as discounts, SUM(final_amount) as net FROM sales').get() || { gross: 0, discounts: 0, net: 0 };
-    const purchases = db.prepare('SELECT SUM(total_amount) as total FROM purchases').get();
-    const expenses = db.prepare('SELECT SUM(amount) as total FROM expenses').get();
+
+    // Revenue — exclude credit_note and adjustment rows from gross revenue,
+    // but include them in net (they carry negative final_amount which naturally offsets)
+    const salesData = db.prepare(`
+      SELECT
+        SUM(CASE WHEN status NOT IN ('credit_note','adjustment') THEN subtotal      ELSE 0 END) as gross,
+        SUM(CASE WHEN status NOT IN ('credit_note','adjustment') THEN discount_amount ELSE 0 END) as discounts,
+        SUM(final_amount) as net
+      FROM sales
+    `).get() || { gross: 0, discounts: 0, net: 0 };
+
+    const purchases    = db.prepare('SELECT SUM(total_amount) as total FROM purchases').get();
+    const expenses     = db.prepare('SELECT SUM(amount) as total FROM expenses').get();
     const manufacturing = db.prepare(`SELECT SUM(total_cost) as total FROM manufacturing_orders WHERE status = 'مكتمل'`).get();
-    const grossSales = parseFloat(salesData?.gross || 0), salesDiscounts = parseFloat(salesData?.discounts || 0), netSales = parseFloat(salesData?.net || 0);
-    const costOfGoods = parseFloat(purchases?.total || 0) + parseFloat(manufacturing?.total || 0);
-    const operatingExpenses = parseFloat(expenses?.total || 0);
-    const netProfit = netSales - costOfGoods - operatingExpenses;
-    res.json({ revenue: { gross_sales: grossSales, less_sales_discounts: salesDiscounts, net_sales: netSales, total: netSales }, cost_of_goods: { purchases: parseFloat(purchases?.total || 0), manufacturing: parseFloat(manufacturing?.total || 0), total: costOfGoods }, gross_profit: netSales - costOfGoods, expenses: { operating: operatingExpenses, total: operatingExpenses }, net_profit: netProfit, year: year || new Date().getFullYear() });
+
+    // Service labour cost: SUM(quantity × artisan_rate) from the LATEST revision of each sale.
+    // artisan_rate is the frozen cost-rate stored at revision-creation time — NOT unit_price.
+    // unit_price is the sale price (revenue side) and must never be used here.
+    // Correlated subquery picks the single highest revision_number per invoice.
+    // Only items with artisan_id (service lines). Excludes credit_note / adjustment rows.
+    const serviceLaborData = db.prepare(`
+      SELECT COALESCE(SUM(iri.quantity * iri.artisan_rate), 0) as total
+      FROM invoice_revision_items iri
+      JOIN invoice_revisions ir ON iri.revision_id = ir.id
+      JOIN sales s ON ir.invoice_id = s.id
+      WHERE iri.artisan_id IS NOT NULL
+        AND s.status NOT IN ('credit_note', 'adjustment')
+        AND ir.revision_number = (
+          SELECT MAX(r2.revision_number)
+          FROM invoice_revisions r2
+          WHERE r2.invoice_id = ir.invoice_id
+        )
+    `).get();
+
+    const grossSales       = parseFloat(salesData?.gross        || 0);
+    const salesDiscounts   = parseFloat(salesData?.discounts    || 0);
+    const netSales         = parseFloat(salesData?.net          || 0);
+    const purchasesCost    = parseFloat(purchases?.total        || 0);
+    const manufacturingCost= parseFloat(manufacturing?.total    || 0);
+    const serviceLaborCost = parseFloat(serviceLaborData?.total || 0);
+    const operatingExpenses= parseFloat(expenses?.total         || 0);
+
+    const costOfGoods  = purchasesCost + manufacturingCost + serviceLaborCost;
+    const grossProfit  = netSales - costOfGoods;
+    const netProfit    = grossProfit - operatingExpenses;
+
+    res.json({
+      revenue: {
+        gross_sales:           grossSales,
+        less_sales_discounts:  salesDiscounts,
+        net_sales:             netSales,
+        total:                 netSales
+      },
+      cost_of_goods: {
+        purchases:      purchasesCost,
+        manufacturing:  manufacturingCost,
+        service_labor:  serviceLaborCost,   // NEW: artisan service cost from latest revisions
+        total:          costOfGoods
+      },
+      gross_profit:  grossProfit,
+      expenses: {
+        operating: operatingExpenses,
+        total:     operatingExpenses
+      },
+      net_profit: netProfit,
+      year: year || new Date().getFullYear()
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2751,6 +3053,784 @@ app.put('/api/opening-balances', (req, res) => {
     db.prepare(`UPDATE opening_balances SET cash = ?, bank = ?, fiscal_year = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1`).run(cash, bank, fiscal_year);
     logAudit('opening_balances', 1, 'update', old, req.body, user || 'system');
     res.json(req.body);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ============================================
+// INVOICE REVISION SYSTEM
+// ============================================
+
+// Helper: get the latest revision for an invoice
+function getFinalInvoiceVersion(invoiceId) {
+  const rev = db.prepare(`
+    SELECT r.*, MAX(r.revision_number) as rev_num
+    FROM invoice_revisions r
+    WHERE r.invoice_id = ?
+    GROUP BY r.invoice_id
+  `).get(invoiceId);
+  if (!rev) return null;
+  const items = db.prepare(`
+    SELECT iri.*, st.name as service_name, a.name as artisan_name
+    FROM invoice_revision_items iri
+    LEFT JOIN service_types st ON iri.service_type_id = st.id
+    LEFT JOIN artisans a ON iri.artisan_id = a.id
+    WHERE iri.revision_id = ?
+  `).all(rev.id);
+  return { ...rev, items };
+}
+
+// Helper: apply artisan workload delta (SERVICE artisans only)
+function adjustArtisanWorkload(artisanId, serviceTypeId, deltaQty, unitPrice, date, refType, refId, user) {
+  if (!artisanId) return;
+  // Verify this is a SERVICE artisan
+  const artisan = db.prepare(`SELECT artisan_type FROM artisans WHERE id = ?`).get(artisanId);
+  if (!artisan || artisan.artisan_type === 'SABRA_PACKING') return;
+
+  const amount = Math.abs(deltaQty * (unitPrice || 0));
+  if (amount === 0) return;
+
+  if (deltaQty > 0) {
+    // Increase: debit (earn) on artisan account
+    db.prepare(`
+      INSERT INTO artisan_accounts (artisan_id, date, type, amount, description, reference_type, reference_id)
+      VALUES (?, ?, 'debit', ?, ?, ?, ?)
+    `).run(artisanId, date, amount, `إضافة خدمة - مراجعة فاتورة`, refType, refId);
+    db.prepare(`UPDATE artisans SET account_balance = account_balance + ? WHERE id = ?`).run(amount, artisanId);
+  } else {
+    // Decrease: credit (reduce owed) on artisan account
+    db.prepare(`
+      INSERT INTO artisan_accounts (artisan_id, date, type, amount, description, reference_type, reference_id)
+      VALUES (?, ?, 'credit', ?, ?, ?, ?)
+    `).run(artisanId, date, amount, `تخفيض خدمة - مراجعة فاتورة`, refType, refId);
+    db.prepare(`UPDATE artisans SET account_balance = account_balance - ? WHERE id = ?`).run(amount, artisanId);
+  }
+}
+
+// GET /api/sales/:id/revisions — list all revisions for an invoice
+app.get('/api/sales/:id/revisions', (req, res) => {
+  try {
+    const saleId = parseInt(req.params.id);
+    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId);
+    if (!sale) return res.status(404).json({ error: 'الفاتورة غير موجودة' });
+
+    const revisions = db.prepare(`
+      SELECT r.*, u.created_by
+      FROM invoice_revisions r
+      WHERE r.invoice_id = ?
+      ORDER BY r.revision_number ASC
+    `).all(saleId);
+
+    revisions.forEach(rev => {
+      rev.items = db.prepare(`
+        SELECT iri.*, st.name as service_name, a.name as artisan_name
+        FROM invoice_revision_items iri
+        LEFT JOIN service_types st ON iri.service_type_id = st.id
+        LEFT JOIN artisans a ON iri.artisan_id = a.id
+        WHERE iri.revision_id = ?
+      `).all(rev.id);
+    });
+
+    res.json({ sale, revisions });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/sales/:id/final — get the latest revision items
+app.get('/api/sales/:id/final', (req, res) => {
+  try {
+    const saleId = parseInt(req.params.id);
+    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId);
+    if (!sale) return res.status(404).json({ error: 'الفاتورة غير موجودة' });
+
+    const finalVersion = getFinalInvoiceVersion(saleId);
+    if (!finalVersion) {
+      // No revisions yet — return the original sales_items
+      const items = db.prepare(`
+        SELECT si.*, st.name as service_name
+        FROM sales_items si
+        LEFT JOIN service_types st ON si.inventory_id = st.id
+        WHERE si.sale_id = ?
+      `).all(saleId);
+      return res.json({ sale, revision: null, items });
+    }
+    res.json({ sale, revision: finalVersion, items: finalVersion.items });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/sales/:id/revision — create a new revision
+// Body: { reason, created_by, items: [{service_type_id, quantity, unit_price, artisan_id, status}] }
+app.post('/api/sales/:id/revision', (req, res) => {
+  try {
+    const saleId = parseInt(req.params.id);
+    const { reason, created_by, items } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'يجب تضمين عناصر المراجعة' });
+    }
+
+    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId);
+    if (!sale) return res.status(404).json({ error: 'الفاتورة غير موجودة' });
+
+    // Cannot revise a Delivered invoice — must use credit-note or adjustment
+    if (sale.invoice_status === 'Delivered') {
+      return res.status(400).json({
+        error: 'لا يمكن تعديل فاتورة مسلّمة. استخدم إشعار الدائن أو فاتورة التسوية.',
+        use: ['credit-note', 'adjustment']
+      });
+    }
+
+    // Validate: no duplicate (service_type_id, artisan_id) pairs within this submission
+    const pairsSeen = new Set();
+    for (const item of items) {
+      const pairKey = `${item.service_type_id ?? 'null'}:${item.artisan_id ?? 'null'}`;
+      if (pairsSeen.has(pairKey)) {
+        return res.status(400).json({
+          error: `عنصر مكرر في الطلب: service_type_id=${item.service_type_id} artisan_id=${item.artisan_id}. لا يمكن تكرار نفس الخدمة والصانع في مراجعة واحدة.`
+        });
+      }
+      pairsSeen.add(pairKey);
+    }
+
+    // Validate: all artisans referenced must be SERVICE type
+    for (const item of items) {
+      if (item.artisan_id) {
+        const art = db.prepare(`SELECT artisan_type FROM artisans WHERE id = ?`).get(item.artisan_id);
+        if (!art) return res.status(400).json({ error: `الصانع رقم ${item.artisan_id} غير موجود` });
+        if (art.artisan_type === 'SABRA_PACKING') {
+          return res.status(400).json({ error: `لا يمكن ربط صانع سبرة/تعبئة بفاتورة خدمة. الصانع رقم ${item.artisan_id} من نوع SABRA_PACKING` });
+        }
+      }
+    }
+
+    const revisionTx = db.transaction(() => {
+      // Determine next revision number
+      const lastRev = db.prepare(`
+        SELECT MAX(revision_number) as max_rev FROM invoice_revisions WHERE invoice_id = ?
+      `).get(saleId);
+      const newRevNum = (lastRev?.max_rev || 0) + 1;
+
+      // Get previous revision items for delta calculation
+      let prevItems = [];
+      if (lastRev?.max_rev) {
+        const prevRev = db.prepare(`SELECT id FROM invoice_revisions WHERE invoice_id = ? AND revision_number = ?`).get(saleId, lastRev.max_rev);
+        if (prevRev) {
+          prevItems = db.prepare(`SELECT * FROM invoice_revision_items WHERE revision_id = ?`).all(prevRev.id);
+        }
+      } else {
+        // Use original sales_items as baseline (treat service_type_id = null, artisan_id = null)
+        prevItems = [];
+      }
+
+      // Create revision record
+      const revResult = db.prepare(`
+        INSERT INTO invoice_revisions (invoice_id, revision_number, reason, created_by)
+        VALUES (?, ?, ?, ?)
+      `).run(saleId, newRevNum, reason || null, created_by || 'system');
+      const revId = revResult.lastInsertRowid;
+
+      const today = new Date().toISOString().split('T')[0];
+
+      // Prepared once: fetch the latest effective artisan rate for a (artisan, service) pair.
+      // Returns the row with the highest effective_from that is <= today.
+      // Falls back to the baseline row (effective_from = '2000-01-01') if no dated row exists.
+      const stmtFetchRate = db.prepare(`
+        SELECT rate
+        FROM artisan_service_rates
+        WHERE artisan_id = ?
+          AND service_type_id = ?
+          AND effective_from <= ?
+        ORDER BY effective_from DESC
+        LIMIT 1
+      `);
+
+      // Insert new revision items and compute artisan deltas
+      items.forEach(item => {
+        // Fetch and freeze the artisan cost-rate at the moment of revision creation.
+        // artisan_rate is the COST (what we pay the artisan).
+        // unit_price is the REVENUE (what we charge the client). These are separate values.
+        let frozenArtisanRate = 0;
+        if (item.artisan_id && item.service_type_id) {
+          const rateRow = stmtFetchRate.get(item.artisan_id, item.service_type_id, today);
+          frozenArtisanRate = rateRow ? parseFloat(rateRow.rate || 0) : 0;
+        }
+
+        db.prepare(`
+          INSERT INTO invoice_revision_items
+            (revision_id, service_type_id, quantity, unit_price, artisan_id, artisan_rate, status, notes)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          revId,
+          item.service_type_id || null,
+          item.quantity || 0,
+          item.unit_price || 0,       // sale price — revenue side, unchanged
+          item.artisan_id || null,
+          frozenArtisanRate,          // cost rate — frozen permanently for this revision row
+          item.status || 'Draft',
+          item.notes || null
+        );
+
+        // Find matching previous item (by service_type_id + artisan_id)
+        const prev = prevItems.find(p =>
+          p.service_type_id === item.service_type_id && p.artisan_id === item.artisan_id
+        );
+        const prevQty = prev ? parseFloat(prev.quantity || 0) : 0;
+        const newQty  = parseFloat(item.quantity || 0);
+        const deltaQty = newQty - prevQty;
+
+        if (deltaQty !== 0) {
+          // Use frozenArtisanRate (cost) for workload accounting — NOT unit_price (revenue)
+          adjustArtisanWorkload(
+            item.artisan_id,
+            item.service_type_id,
+            deltaQty,
+            frozenArtisanRate,        // cost rate, not sale price
+            today,
+            'invoice_revision',
+            revId,
+            created_by || 'system'
+          );
+        }
+
+        // Handle artisan change: previous artisan different from new one
+        if (prev && prev.artisan_id && prev.artisan_id !== item.artisan_id) {
+          // Reverse the previous artisan's workload using the rate frozen in THAT revision item
+          adjustArtisanWorkload(
+            prev.artisan_id,
+            prev.service_type_id,
+            -prevQty,
+            parseFloat(prev.artisan_rate || 0),   // use the rate frozen on the previous item
+            today,
+            'invoice_revision',
+            revId,
+            created_by || 'system'
+          );
+        }
+      });
+
+      // Handle items that were in previous revision but NOT in new revision (removed services)
+      prevItems.forEach(prev => {
+        const stillPresent = items.find(i =>
+          i.service_type_id === prev.service_type_id && i.artisan_id === prev.artisan_id
+        );
+        if (!stillPresent && prev.artisan_id) {
+          // Reverse using the rate frozen on the previous revision item
+          adjustArtisanWorkload(
+            prev.artisan_id,
+            prev.service_type_id,
+            -parseFloat(prev.quantity || 0),
+            parseFloat(prev.artisan_rate || 0),   // frozen rate from previous revision
+            today,
+            'invoice_revision',
+            revId,
+            created_by || 'system'
+          );
+        }
+      });
+
+      // Recalculate invoice total from new items
+      const newSubtotal = items.reduce((sum, i) => sum + (parseFloat(i.quantity || 0) * parseFloat(i.unit_price || 0)), 0);
+      const discountAmt = parseFloat(sale.discount_amount || 0);
+      const newFinal = Math.max(0, newSubtotal - discountAmt);
+
+      // Update main sale record — preserve invoice_status if already set to a later stage
+      // (e.g. do NOT regress Sent_To_Artisan back to In_Progress)
+      const currentStatus = sale.invoice_status || 'Draft';
+      const STATUS_ORDER = ['Draft','Confirmed','Sent_To_Artisan','In_Progress','Completed','Delivered','Closed'];
+      const currentIdx = STATUS_ORDER.indexOf(currentStatus);
+      const revisionStatus = 'In_Progress';
+      const revisionIdx = STATUS_ORDER.indexOf(revisionStatus);
+      // Only advance to In_Progress if current status is earlier in the lifecycle
+      const nextStatus = currentIdx >= revisionIdx ? currentStatus : revisionStatus;
+
+      db.prepare(`
+        UPDATE sales SET subtotal = ?, final_amount = ?, invoice_status = ?
+        WHERE id = ?
+      `).run(newSubtotal, newFinal, nextStatus, saleId);
+
+      // Recompute remaining balance after final_amount changed.
+      // computeRemaining() uses sales_payments SUM — deposit rows are already in there —
+      // so this value correctly reflects: newFinal − all payments (including any deposits).
+      // We expose this in the response so the caller can update the UI without a second request.
+      const newRemaining = parseFloat(newFinal) -
+        parseFloat(db.prepare(`SELECT COALESCE(SUM(amount),0) as t FROM sales_payments WHERE sale_id = ?`).get(saleId).t || 0);
+
+      // Audit
+      logAudit('invoice_revisions', revId, 'create', null,
+        { invoice_id: saleId, revision_number: newRevNum, reason, items },
+        created_by || 'system', reason);
+
+      return { revId, newRevNum, newSubtotal, newFinal, newRemaining };
+    });
+
+    const result = revisionTx();
+    res.status(201).json({
+      message: 'تم إنشاء المراجعة بنجاح',
+      revision_id:       result.revId,
+      revision_number:   result.newRevNum,
+      new_subtotal:      result.newSubtotal,
+      new_final_amount:  result.newFinal,
+      remaining_balance: result.newRemaining   // final_amount − all payments (incl. deposits)
+    });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// POST /api/sales/:id/status — update invoice lifecycle status
+// Body: { status, user }
+// Valid statuses: Draft, Confirmed, Sent_To_Artisan, In_Progress, Completed, Delivered, Closed
+app.post('/api/sales/:id/status', (req, res) => {
+  try {
+    const saleId = parseInt(req.params.id);
+    const { status, user } = req.body;
+    const VALID_STATUSES = ['Draft', 'Confirmed', 'Sent_To_Artisan', 'In_Progress', 'Completed', 'Delivered', 'Closed'];
+    if (!VALID_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `حالة غير صالحة. المسموح به: ${VALID_STATUSES.join(', ')}` });
+    }
+    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId);
+    if (!sale) return res.status(404).json({ error: 'الفاتورة غير موجودة' });
+
+    const oldStatus = sale.invoice_status;
+    db.prepare(`UPDATE sales SET invoice_status = ? WHERE id = ?`).run(status, saleId);
+    logAudit('sales', saleId, 'status_change', { invoice_status: oldStatus }, { invoice_status: status }, user || 'system');
+    res.json({ id: saleId, old_status: oldStatus, new_status: status });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// POST /api/sales/:id/credit-note — create a credit note for a Delivered invoice
+// Body: { reason, created_by, items: [{service_type_id, quantity, unit_price, artisan_id}], payments? }
+app.post('/api/sales/:id/credit-note', (req, res) => {
+  try {
+    const saleId = parseInt(req.params.id);
+    const { reason, created_by, items, payments } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'يجب تضمين عناصر إشعار الدائن' });
+    }
+
+    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId);
+    if (!sale) return res.status(404).json({ error: 'الفاتورة غير موجودة' });
+
+    const creditTx = db.transaction(() => {
+      const today = new Date().toISOString().split('T')[0];
+
+      // Calculate credit note totals (negative amounts)
+      const creditSubtotal = items.reduce((sum, i) => sum + (parseFloat(i.quantity || 0) * parseFloat(i.unit_price || 0)), 0);
+
+      // Generate credit note invoice number
+      const origNum = sale.invoice_number;
+      const creditNum = `CN-${origNum}-${Date.now()}`;
+
+      // Create credit note as a new sale record with negative final_amount
+      const creditResult = db.prepare(`
+        INSERT INTO sales (invoice_number, date, client_id, client_name, client_phone,
+                           subtotal, discount_percent, discount_amount, final_amount,
+                           status, invoice_status, notes, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, 'credit_note', 'Closed', ?, ?)
+      `).run(
+        creditNum, today,
+        sale.client_id, sale.client_name, sale.client_phone,
+        -creditSubtotal, -creditSubtotal,
+        `إشعار دائن للفاتورة ${origNum}: ${reason || ''}`,
+        created_by || 'system'
+      );
+      const creditSaleId = creditResult.lastInsertRowid;
+
+      // Insert credit note items (negative quantities)
+      items.forEach(item => {
+        db.prepare(`
+          INSERT INTO sales_items (sale_id, inventory_id, product_name, quantity, unit_price, total_price)
+          VALUES (?, NULL, ?, ?, ?, ?)
+        `).run(
+          creditSaleId,
+          item.service_name || `خدمة ${item.service_type_id || ''}`,
+          -Math.abs(parseFloat(item.quantity || 0)),
+          parseFloat(item.unit_price || 0),
+          -(Math.abs(parseFloat(item.quantity || 0)) * parseFloat(item.unit_price || 0))
+        );
+
+        // Reverse artisan workload (SERVICE artisans only)
+        if (item.artisan_id) {
+          adjustArtisanWorkload(
+            item.artisan_id,
+            item.service_type_id,
+            -Math.abs(parseFloat(item.quantity || 0)),
+            parseFloat(item.unit_price || 0),
+            today,
+            'credit_note',
+            creditSaleId,
+            created_by || 'system'
+          );
+        }
+      });
+
+      // Link credit note to original via a revision entry
+      const lastRev = db.prepare(`SELECT MAX(revision_number) as max_rev FROM invoice_revisions WHERE invoice_id = ?`).get(saleId);
+      const nextRevNum = (lastRev?.max_rev || 0) + 1;
+      db.prepare(`
+        INSERT INTO invoice_revisions (invoice_id, revision_number, reason, created_by)
+        VALUES (?, ?, ?, ?)
+      `).run(saleId, nextRevNum, `إشعار دائن: ${creditNum} - ${reason || ''}`, created_by || 'system');
+
+      // If client debt was created, reduce it back
+      if (sale.client_id && creditSubtotal > 0) {
+        db.prepare(`UPDATE clients SET balance = balance - ? WHERE id = ? AND balance >= ?`)
+          .run(creditSubtotal, sale.client_id, creditSubtotal);
+      }
+
+      logAudit('sales', creditSaleId, 'credit_note', null, {
+        original_sale_id: saleId, reason, items
+      }, created_by || 'system', reason);
+
+      return { creditSaleId, creditNum, creditSubtotal };
+    });
+
+    const result = creditTx();
+    res.status(201).json({
+      message: 'تم إنشاء إشعار الدائن بنجاح',
+      credit_note_id: result.creditSaleId,
+      credit_note_number: result.creditNum,
+      credit_amount: result.creditSubtotal
+    });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// POST /api/sales/:id/adjustment — create an adjustment (additional) sale linked to original
+// Body: { reason, created_by, items: [{service_type_id, service_name, quantity, unit_price, artisan_id}], payments? }
+app.post('/api/sales/:id/adjustment', (req, res) => {
+  try {
+    const saleId = parseInt(req.params.id);
+    const { reason, created_by, items, payments } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'يجب تضمين عناصر فاتورة التسوية' });
+    }
+
+    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId);
+    if (!sale) return res.status(404).json({ error: 'الفاتورة غير موجودة' });
+
+    // Validate: all artisans must be SERVICE type
+    for (const item of items) {
+      if (item.artisan_id) {
+        const art = db.prepare(`SELECT artisan_type FROM artisans WHERE id = ?`).get(item.artisan_id);
+        if (!art) return res.status(400).json({ error: `الصانع رقم ${item.artisan_id} غير موجود` });
+        if (art.artisan_type === 'SABRA_PACKING') {
+          return res.status(400).json({ error: `لا يمكن ربط صانع سبرة بفاتورة خدمة. الصانع رقم ${item.artisan_id}` });
+        }
+      }
+    }
+
+    const adjTx = db.transaction(() => {
+      const today = new Date().toISOString().split('T')[0];
+      const adjSubtotal = items.reduce((sum, i) => sum + (parseFloat(i.quantity || 0) * parseFloat(i.unit_price || 0)), 0);
+      const adjNum = `ADJ-${sale.invoice_number}-${Date.now()}`;
+
+      // Create adjustment as new positive sale
+      const adjResult = db.prepare(`
+        INSERT INTO sales (invoice_number, date, client_id, client_name, client_phone,
+                           subtotal, discount_percent, discount_amount, final_amount,
+                           status, invoice_status, notes, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, 'adjustment', 'Closed', ?, ?)
+      `).run(
+        adjNum, today,
+        sale.client_id, sale.client_name, sale.client_phone,
+        adjSubtotal, adjSubtotal,
+        `تسوية للفاتورة ${sale.invoice_number}: ${reason || ''}`,
+        created_by || 'system'
+      );
+      const adjSaleId = adjResult.lastInsertRowid;
+
+      // Insert adjustment items
+      items.forEach(item => {
+        db.prepare(`
+          INSERT INTO sales_items (sale_id, inventory_id, product_name, quantity, unit_price, total_price)
+          VALUES (?, NULL, ?, ?, ?, ?)
+        `).run(
+          adjSaleId,
+          item.service_name || `خدمة ${item.service_type_id || ''}`,
+          parseFloat(item.quantity || 0),
+          parseFloat(item.unit_price || 0),
+          parseFloat(item.quantity || 0) * parseFloat(item.unit_price || 0)
+        );
+
+        // Add to artisan workload
+        if (item.artisan_id) {
+          adjustArtisanWorkload(
+            item.artisan_id,
+            item.service_type_id,
+            parseFloat(item.quantity || 0),
+            parseFloat(item.unit_price || 0),
+            today,
+            'adjustment',
+            adjSaleId,
+            created_by || 'system'
+          );
+        }
+      });
+
+      // Process payments if provided
+      if (payments && Array.isArray(payments)) {
+        payments.forEach(p => {
+          db.prepare(`INSERT INTO sales_payments (sale_id, payment_type, amount, check_number, check_date, check_due_date, bank) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+            .run(adjSaleId, p.payment_type, p.amount, p.check_number || null, p.check_date || null, p.check_due_date || null, p.bank || null);
+          if (p.payment_type === 'نقدي') {
+            addTreasuryEntry(today, 'وارد', `تسوية - ${adjNum}`, p.amount, 'الصندوق', 'sale', adjSaleId, created_by);
+          }
+          if (p.payment_type === 'تحويل') {
+            addTreasuryEntry(today, 'وارد', `تسوية (تحويل) - ${adjNum}`, p.amount, 'البنك', 'sale', adjSaleId, created_by);
+          }
+          if (p.payment_type === 'آجل' && sale.client_id) {
+            db.prepare('UPDATE clients SET balance = balance + ? WHERE id = ?').run(p.amount, sale.client_id);
+          }
+        });
+      }
+
+      // Link to original via revision entry
+      const lastRev = db.prepare(`SELECT MAX(revision_number) as max_rev FROM invoice_revisions WHERE invoice_id = ?`).get(saleId);
+      const nextRevNum = (lastRev?.max_rev || 0) + 1;
+      db.prepare(`
+        INSERT INTO invoice_revisions (invoice_id, revision_number, reason, created_by)
+        VALUES (?, ?, ?, ?)
+      `).run(saleId, nextRevNum, `تسوية: ${adjNum} - ${reason || ''}`, created_by || 'system');
+
+      logAudit('sales', adjSaleId, 'adjustment', null, {
+        original_sale_id: saleId, reason, items
+      }, created_by || 'system', reason);
+
+      return { adjSaleId, adjNum, adjSubtotal };
+    });
+
+    const result = adjTx();
+    res.status(201).json({
+      message: 'تم إنشاء فاتورة التسوية بنجاح',
+      adjustment_id: result.adjSaleId,
+      adjustment_number: result.adjNum,
+      adjustment_amount: result.adjSubtotal
+    });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// GET /api/artisans — filter by artisan_type if provided
+// This extends the existing generic CRUD endpoint behavior for artisan_type filtering
+app.get('/api/artisans/service', (req, res) => {
+  try {
+    const artisans = db.prepare(`
+      SELECT a.*, COUNT(asi.id) as services_count
+      FROM artisans a
+      LEFT JOIN artisan_services asi ON a.id = asi.artisan_id
+      WHERE a.active = 1 AND (a.artisan_type = 'SERVICE' OR a.artisan_type IS NULL)
+      GROUP BY a.id
+      ORDER BY a.name
+    `).all();
+    res.json(artisans);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// ARTISAN SERVICE RATES ENDPOINTS
+// ============================================
+
+// GET /api/artisans/:id/rates
+// Returns all rate rows for a given artisan, including historical ones,
+// with the latest effective row per service type flagged as is_current = 1.
+app.get('/api/artisans/:id/rates', (req, res) => {
+  try {
+    const artisanId = parseInt(req.params.id);
+    const artisan = db.prepare('SELECT id, name, artisan_type FROM artisans WHERE id = ?').get(artisanId);
+    if (!artisan) return res.status(404).json({ error: 'الصانع غير موجود' });
+    if (artisan.artisan_type === 'SABRA_PACKING') {
+      return res.status(400).json({ error: 'صانع سبرة/تعبئة لا يحتوي على أسعار خدمات' });
+    }
+
+    const rates = db.prepare(`
+      SELECT
+        asr.*,
+        st.name  AS service_name,
+        st.code  AS service_code,
+        CASE WHEN asr.effective_from = (
+          SELECT MAX(r2.effective_from)
+          FROM artisan_service_rates r2
+          WHERE r2.artisan_id  = asr.artisan_id
+            AND r2.service_type_id = asr.service_type_id
+        ) THEN 1 ELSE 0 END AS is_current
+      FROM artisan_service_rates asr
+      JOIN service_types st ON asr.service_type_id = st.id
+      WHERE asr.artisan_id = ?
+      ORDER BY st.name ASC, asr.effective_from DESC
+    `).all(artisanId);
+
+    res.json({ artisan, rates });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/artisans/:id/rates
+// Inserts a NEW rate row — never modifies old rows.
+// effective_from defaults to today so history is preserved exactly.
+// Body: { service_type_id, rate, effective_from? (optional, defaults to CURRENT_DATE), user }
+app.post('/api/artisans/:id/rates', (req, res) => {
+  try {
+    const artisanId = parseInt(req.params.id);
+    const { service_type_id, rate, effective_from, user } = req.body;
+
+    if (!service_type_id) return res.status(400).json({ error: 'service_type_id مطلوب' });
+    if (rate === undefined || rate === null || parseFloat(rate) < 0) {
+      return res.status(400).json({ error: 'rate يجب أن يكون رقماً موجباً أو صفراً' });
+    }
+
+    const artisan = db.prepare('SELECT id, name, artisan_type FROM artisans WHERE id = ?').get(artisanId);
+    if (!artisan) return res.status(404).json({ error: 'الصانع غير موجود' });
+    if (artisan.artisan_type === 'SABRA_PACKING') {
+      return res.status(400).json({ error: 'لا يمكن إضافة أسعار خدمات لصانع سبرة/تعبئة' });
+    }
+
+    const serviceType = db.prepare('SELECT id, name FROM service_types WHERE id = ?').get(service_type_id);
+    if (!serviceType) return res.status(404).json({ error: 'نوع الخدمة غير موجود' });
+
+    const effectiveDate = effective_from || new Date().toISOString().split('T')[0];
+
+    const rateTx = db.transaction(() => {
+      // Fetch the current rate before insert so we can log what changed
+      const prevRate = db.prepare(`
+        SELECT rate, effective_from FROM artisan_service_rates
+        WHERE artisan_id = ? AND service_type_id = ?
+        ORDER BY effective_from DESC
+        LIMIT 1
+      `).get(artisanId, service_type_id);
+
+      // INSERT OR REPLACE handles the case where caller passes the same effective_from
+      // (e.g. correcting a mistake made today). All other historical rows remain untouched.
+      const result = db.prepare(`
+        INSERT INTO artisan_service_rates (artisan_id, service_type_id, rate, effective_from)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(artisan_id, service_type_id, effective_from)
+        DO UPDATE SET rate = excluded.rate
+      `).run(artisanId, service_type_id, parseFloat(rate), effectiveDate);
+
+      logAudit(
+        'artisan_service_rates',
+        result.lastInsertRowid || 0,
+        'create',
+        prevRate || null,
+        { artisan_id: artisanId, service_type_id, rate: parseFloat(rate), effective_from: effectiveDate },
+        user || 'system'
+      );
+
+      return { id: result.lastInsertRowid, effectiveDate, prevRate };
+    });
+
+    const result = rateTx();
+    res.status(201).json({
+      message: `تم تحديث سعر الخدمة "${serviceType.name}" للصانع "${artisan.name}"`,
+      id:             result.id,
+      artisan_id:     artisanId,
+      service_type_id,
+      rate:           parseFloat(rate),
+      effective_from: result.effectiveDate,
+      previous_rate:  result.prevRate ? result.prevRate.rate : null
+    });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ============================================
+// DEPOSIT (ARABOUN) ENDPOINT
+// ============================================
+
+// Helper: compute remaining balance for a sale.
+// remaining = final_amount − SUM(all payments including deposit)
+// The deposit row is already inside sales_payments as payment_type='أرابون',
+// so this is just final_amount - total_paid.  Exposed as a helper so both
+// the deposit endpoint and the revision endpoint share one source of truth.
+function computeRemaining(saleId) {
+  const sale   = db.prepare('SELECT final_amount FROM sales WHERE id = ?').get(saleId);
+  if (!sale) return null;
+  const paid   = db.prepare(`SELECT COALESCE(SUM(amount),0) as total FROM sales_payments WHERE sale_id = ?`).get(saleId);
+  return parseFloat(sale.final_amount || 0) - parseFloat(paid.total || 0);
+}
+
+// POST /api/sales/:id/deposit
+// Records an Araboun (deposit) payment against an invoice.
+// Body: { amount, payment_type, date, check_number?, check_date?, check_due_date?, bank?, user }
+// Rules:
+//   - Deposit stored as payment_type = 'أرابون' in sales_payments
+//   - Updates sales.deposit_amount (running total of all deposits on this invoice)
+//   - Creates matching treasury entry (cash or bank)
+//   - Does NOT duplicate: each call adds ONE payment row; idempotency is caller's responsibility
+//   - Does NOT allow deposit > final_amount
+app.post('/api/sales/:id/deposit', (req, res) => {
+  try {
+    const saleId = parseInt(req.params.id);
+    const { amount, payment_type, date, check_number, check_date, check_due_date, bank, user } = req.body;
+
+    if (!amount || parseFloat(amount) <= 0) {
+      return res.status(400).json({ error: 'مبلغ العربون يجب أن يكون أكبر من الصفر' });
+    }
+
+    const depositAmt = parseFloat(amount);
+
+    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId);
+    if (!sale) return res.status(404).json({ error: 'الفاتورة غير موجودة' });
+
+    // Guard: deposit must not exceed current remaining balance
+    const currentRemaining = computeRemaining(saleId);
+    if (depositAmt > currentRemaining + 0.001) {   // 0.001 tolerance for float rounding
+      return res.status(400).json({
+        error: `مبلغ العربون (${depositAmt}) يتجاوز الرصيد المتبقي (${currentRemaining.toFixed(2)})`,
+        remaining: currentRemaining
+      });
+    }
+
+    const depositTx = db.transaction(() => {
+      const payDate = date || new Date().toISOString().split('T')[0];
+
+      // 1. Insert payment row — type is always 'أرابون' regardless of cash/check/transfer
+      //    We store the actual payment method alongside so treasury routing works correctly.
+      const payResult = db.prepare(`
+        INSERT INTO sales_payments
+          (sale_id, payment_type, amount, check_number, check_date, check_due_date, bank)
+        VALUES (?, 'أرابون', ?, ?, ?, ?, ?)
+      `).run(saleId, depositAmt, check_number || null, check_date || null, check_due_date || null, bank || null);
+      const payId = payResult.lastInsertRowid;
+
+      // 2. Update sales.deposit_amount (cumulative sum of all deposits)
+      db.prepare(`UPDATE sales SET deposit_amount = COALESCE(deposit_amount, 0) + ? WHERE id = ?`)
+        .run(depositAmt, saleId);
+
+      // 3. Treasury entry — route by actual payment method supplied by caller
+      const invoiceNum = sale.invoice_number;
+      const effectiveMethod = (payment_type || 'نقدي');
+      if (effectiveMethod === 'نقدي') {
+        addTreasuryEntry(payDate, 'وارد',
+          `عربون - فاتورة ${invoiceNum}`,
+          depositAmt, 'الصندوق', 'sale_deposit', saleId, user || 'system');
+      } else if (effectiveMethod === 'تحويل' || effectiveMethod === 'TPE') {
+        addTreasuryEntry(payDate, 'وارد',
+          `عربون (${effectiveMethod}) - فاتورة ${invoiceNum}`,
+          depositAmt, 'البنك', 'sale_deposit', saleId, user || 'system');
+      } else if (effectiveMethod === 'شيك') {
+        // Add to checks portfolio for collection
+        db.prepare(`
+          INSERT INTO checks_portfolio
+            (check_number, date, from_client, amount, due_date, bank, status, source)
+          VALUES (?, ?, ?, ?, ?, ?, 'معلق', 'عربون')
+        `).run(check_number, payDate, sale.client_name || 'عميل عابر',
+               depositAmt, check_due_date, bank);
+      }
+
+      // 4. Audit
+      logAudit('sales_payments', payId, 'deposit',
+        null,
+        { sale_id: saleId, amount: depositAmt, payment_type: effectiveMethod },
+        user || 'system');
+
+      // 5. Return fresh remaining
+      const newRemaining = computeRemaining(saleId);
+      return { payId, newRemaining };
+    });
+
+    const result = depositTx();
+    res.status(201).json({
+      message: 'تم تسجيل العربون بنجاح',
+      payment_id:       result.payId,
+      deposit_amount:   depositAmt,
+      remaining_balance: result.newRemaining
+    });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
