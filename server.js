@@ -552,13 +552,31 @@ CREATE TABLE IF NOT EXISTS invoice_revision_items (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(revision_id) REFERENCES invoice_revisions(id),
   FOREIGN KEY(service_type_id) REFERENCES service_types(id),
-  FOREIGN KEY(artisan_id) REFERENCES artisans(id),
-  -- Enforce: one row per (revision, service, artisan) combination
-  UNIQUE(revision_id, COALESCE(service_type_id, 0), COALESCE(artisan_id, 0))
+  FOREIGN KEY(artisan_id) REFERENCES artisans(id)
+  -- Uniqueness enforced via idx_unique_revision_item index below (COALESCE not allowed in table UNIQUE)
 );
 `;
 
 db.exec(schema);
+
+// ============================================
+// UNIQUE INDEX: invoice_revision_items
+// SQLite forbids expressions (COALESCE/IFNULL) inside a table-level UNIQUE constraint,
+// so we create a partial unique index here instead. IFNULL maps NULL → 0 so that two
+// NULL values are treated as equal (preventing duplicate service+artisan pairs).
+// ============================================
+try {
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_revision_item
+    ON invoice_revision_items (
+      revision_id,
+      IFNULL(service_type_id, 0),
+      IFNULL(artisan_id, 0)
+    )
+  `);
+} catch (revItemIdxErr) {
+  console.error('[MIGRATION WARNING] idx_unique_revision_item index:', revItemIdxErr.message);
+}
 
 // ============================================
 // MIGRATION: Deduplicate inventory & add UNIQUE constraint
