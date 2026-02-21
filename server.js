@@ -812,6 +812,32 @@ try {
   console.error('[MIGRATION WARNING] Revision 1 backfill:', backfillErr.message);
 }
 
+// ============================================
+// MIGRATION: Add status + applied_credit columns to purchases
+// ============================================
+try {
+  const purchCols = db.prepare("PRAGMA table_info(purchases)").all().map(c => c.name);
+  if (!purchCols.includes('status')) {
+    db.exec(`ALTER TABLE purchases ADD COLUMN status TEXT DEFAULT 'OPEN'`);
+    // Mark existing purchases as CLOSED if fully paid, else OPEN
+    db.prepare(`
+      UPDATE purchases SET status = CASE
+        WHEN total_amount <= COALESCE(
+          (SELECT SUM(amount) FROM purchases_payments WHERE purchase_id = purchases.id), 0
+        ) THEN 'CLOSED'
+        ELSE 'OPEN'
+      END
+    `).run();
+    console.log('[MIGRATION] Added status column to purchases');
+  }
+  if (!purchCols.includes('applied_credit')) {
+    db.exec(`ALTER TABLE purchases ADD COLUMN applied_credit REAL DEFAULT 0`);
+    console.log('[MIGRATION] Added applied_credit column to purchases');
+  }
+} catch (purchMigErr) {
+  console.error('[MIGRATION WARNING] purchases columns migration:', purchMigErr.message);
+}
+
 // Middleware
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(compression());
@@ -2503,6 +2529,18 @@ app.put('/api/special-orders/:id', (req, res) => {
 // API ENDPOINTS - PURCHASES
 // ============================================
 
+// Helper: compute dynamic supplier balance (positive = we owe, negative = supplier credit)
+function getSupplierBalance(supplierId) {
+  const totalInvoiced = db.prepare(`SELECT COALESCE(SUM(total_amount), 0) as total FROM purchases WHERE supplier_id = ?`).get(supplierId).total;
+  const totalPaid = db.prepare(`
+    SELECT COALESCE(SUM(pp.amount), 0) as total
+    FROM purchases_payments pp
+    INNER JOIN purchases pur ON pp.purchase_id = pur.id
+    WHERE pur.supplier_id = ?
+  `).get(supplierId).total;
+  return totalInvoiced - totalPaid;
+}
+
 app.get('/api/purchases', (req, res) => {
   try {
     const { from_date, to_date, supplier_id, period } = req.query;
@@ -2527,28 +2565,48 @@ app.get('/api/purchases', (req, res) => {
     }
 
     const purchases = db.prepare(`
-      SELECT p.*, s.name as supplier_name
+      SELECT p.*, s.name as supplier_name_resolved
       FROM purchases p
       LEFT JOIN suppliers s ON p.supplier_id = s.id
       WHERE 1=1 ${dateFilter}
       ORDER BY p.date DESC
     `).all(...params);
 
-    // Get items and payments for each purchase
-    purchases.forEach(purchase => {
-      purchase.items = db.prepare(`SELECT * FROM purchases_items WHERE purchase_id = ?`).all(purchase.id);
-      purchase.payments = db.prepare(`SELECT * FROM purchases_payments WHERE purchase_id = ?`).all(purchase.id);
+    const getItems    = db.prepare(`SELECT * FROM purchases_items WHERE purchase_id = ?`);
+    const getPayments = db.prepare(`SELECT * FROM purchases_payments WHERE purchase_id = ?`);
 
-      // Calculate totals
-      purchase.total_paid = purchase.payments.reduce((sum, p) => sum + parseFloat(p.amount || 0), 0);
-      purchase.remaining = purchase.total_amount - purchase.total_paid;
+    // Cache supplier balances to avoid redundant queries
+    const supplierBalanceCache = {};
+
+    purchases.forEach(purchase => {
+      purchase.items    = getItems.all(purchase.id);
+      purchase.payments = getPayments.all(purchase.id);
+
+      // Computed fields (dynamic, never rely on stored totals)
+      const total_paid  = purchase.payments.reduce((sum, p) => sum + parseFloat(p.amount || 0), 0);
+      const applied_credit = parseFloat(purchase.applied_credit || 0);
+      const remaining   = Math.max(0, purchase.total_amount - applied_credit - total_paid);
+
+      purchase.total_paid     = total_paid;
+      purchase.applied_credit = applied_credit;
+      purchase.remaining      = remaining;
+      // Re-sync status dynamically (source of truth is the equation)
+      purchase.status         = remaining <= 0 ? 'CLOSED' : 'OPEN';
+
+      if (purchase.supplier_id) {
+        if (supplierBalanceCache[purchase.supplier_id] === undefined) {
+          supplierBalanceCache[purchase.supplier_id] = getSupplierBalance(purchase.supplier_id);
+        }
+        purchase.supplier_balance = supplierBalanceCache[purchase.supplier_id];
+      } else {
+        purchase.supplier_balance = 0;
+      }
     });
 
-    // Calculate KPIs
     const kpis = {
       total_purchases: purchases.reduce((sum, p) => sum + parseFloat(p.total_amount || 0), 0),
-      total_paid: purchases.reduce((sum, p) => sum + parseFloat(p.total_paid || 0), 0),
-      total_remaining: purchases.reduce((sum, p) => sum + parseFloat(p.remaining || 0), 0),
+      total_paid:      purchases.reduce((sum, p) => sum + parseFloat(p.total_paid   || 0), 0),
+      total_remaining: purchases.reduce((sum, p) => sum + parseFloat(p.remaining    || 0), 0),
       count: purchases.length
     };
 
@@ -2559,27 +2617,162 @@ app.get('/api/purchases', (req, res) => {
 app.post('/api/purchases', (req, res) => {
   try {
     const { invoice_number, date, supplier_id, supplier_name, items, payments, notes, user } = req.body;
-    const total_amount = items.reduce((sum, item) => sum + item.total_cost, 0);
-    const purchaseResult = db.prepare(`INSERT INTO purchases (invoice_number, date, supplier_id, supplier_name, total_amount, notes) VALUES (?, ?, ?, ?, ?, ?)`).run(invoice_number, date, supplier_id, supplier_name, total_amount, notes);
-    const purchaseId = purchaseResult.lastInsertRowid;
-    const insertItem = db.prepare(`INSERT INTO purchases_items (purchase_id, inventory_id, quantity, unit_cost, total_cost) VALUES (?, ?, ?, ?, ?)`);
-    items.forEach(item => {
-      insertItem.run(purchaseId, item.inventory_id, item.quantity, item.unit_cost, item.total_cost);
-      db.prepare('UPDATE inventory SET quantity = quantity + ?, unit_cost = ? WHERE id = ?').run(item.quantity, item.unit_cost, item.inventory_id);
-      db.prepare(`INSERT INTO inventory_movements (inventory_id, movement_type, quantity, unit_cost, reference_type, reference_id, created_by) VALUES (?, 'in', ?, ?, 'purchase', ?, ?)`).run(item.inventory_id, item.quantity, item.unit_cost, purchaseId, user || 'system');
-    });
-    const insertPayment = db.prepare(`INSERT INTO purchases_payments (purchase_id, payment_type, amount, check_number, check_date, check_due_date, bank, source_check_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-    payments.forEach(p => {
-      insertPayment.run(purchaseId, p.payment_type, p.amount, p.check_number || null, p.check_date || null, p.check_due_date || null, p.bank || null, p.source_check_id || null);
-      if (p.payment_type === 'نقدي') addTreasuryEntry(date, 'صادر', `مشتريات - فاتورة ${invoice_number}`, p.amount, 'الصندوق', 'purchase', purchaseId, user);
-      if (p.payment_type === 'شيك' || p.payment_type === 'شيك_مظهر') {
-        db.prepare(`INSERT INTO checks_issued (check_number, date, to_supplier, amount, due_date, bank, type, source_check_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(p.check_number, date, supplier_name, p.amount, p.check_due_date, p.bank, p.payment_type === 'شيك_مظهر' ? 'مظهّر' : 'شيكاتي', p.source_check_id || null);
-        if (p.source_check_id) db.prepare(`UPDATE checks_portfolio SET used_for_payment = 1, status = 'مظهّر', endorsed_to = ?, endorsed_date = ? WHERE id = ?`).run(supplier_name, date, p.source_check_id);
+
+    // Input validation
+    if (!items || items.length === 0) return res.status(400).json({ error: 'No items provided' });
+    for (const item of items) {
+      if (!item.quantity || parseFloat(item.quantity) <= 0) return res.status(400).json({ error: 'Invalid item quantity' });
+      if (!item.unit_cost || parseFloat(item.unit_cost) <= 0) return res.status(400).json({ error: 'Invalid item cost' });
+    }
+    // Prevent duplicate inventory items in same purchase
+    const invIds = items.map(i => i.inventory_id);
+    if (new Set(invIds).size !== invIds.length) return res.status(400).json({ error: 'Duplicate items in purchase' });
+
+    const total_amount = items.reduce((sum, item) => sum + parseFloat(item.total_cost), 0);
+    if (total_amount <= 0) return res.status(400).json({ error: 'Invalid total amount' });
+
+    const createPurchase = db.transaction(() => {
+      // 1. Compute supplier credit BEFORE inserting (so it reflects existing history only)
+      let applied_credit = 0;
+      if (supplier_id) {
+        const balanceBefore = getSupplierBalance(supplier_id);
+        // balanceBefore < 0 means supplier owes us (credit available)
+        const credit_available = balanceBefore < 0 ? Math.abs(balanceBefore) : 0;
+        if (credit_available > 0) {
+          applied_credit = Math.min(credit_available, total_amount);
+        }
       }
+
+      // 2. Determine status from credit + initial payments
+      const payments_total = (payments || []).reduce((sum, p) => sum + parseFloat(p.amount || 0), 0);
+      const remaining_after = Math.max(0, total_amount - applied_credit - payments_total);
+      const status = remaining_after <= 0 ? 'CLOSED' : 'OPEN';
+
+      // 3. Insert purchase
+      const purchaseResult = db.prepare(`
+        INSERT INTO purchases (invoice_number, date, supplier_id, supplier_name, total_amount, notes, status, applied_credit)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(invoice_number, date, supplier_id, supplier_name, total_amount, notes, status, applied_credit);
+      const purchaseId = purchaseResult.lastInsertRowid;
+
+      // 4. Insert items + inventory update + movement log
+      const insertItem = db.prepare(`INSERT INTO purchases_items (purchase_id, inventory_id, quantity, unit_cost, total_cost) VALUES (?, ?, ?, ?, ?)`);
+      items.forEach(item => {
+        insertItem.run(purchaseId, item.inventory_id, item.quantity, item.unit_cost, item.total_cost);
+        db.prepare('UPDATE inventory SET quantity = quantity + ?, unit_cost = ? WHERE id = ?').run(item.quantity, item.unit_cost, item.inventory_id);
+        db.prepare(`INSERT INTO inventory_movements (inventory_id, movement_type, quantity, unit_cost, reference_type, reference_id, created_by) VALUES (?, 'in', ?, ?, 'purchase', ?, ?)`).run(item.inventory_id, item.quantity, item.unit_cost, purchaseId, user || 'system');
+      });
+
+      // 5. Insert payments + treasury entries
+      const insertPayment = db.prepare(`INSERT INTO purchases_payments (purchase_id, payment_type, amount, check_number, check_date, check_due_date, bank, source_check_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+      (payments || []).forEach(p => {
+        if (!p.amount || parseFloat(p.amount) <= 0) return;
+        insertPayment.run(purchaseId, p.payment_type, p.amount, p.check_number || null, p.check_date || null, p.check_due_date || null, p.bank || null, p.source_check_id || null);
+
+        if (p.payment_type === 'نقدي') {
+          addTreasuryEntry(date, 'صادر', `مشتريات - فاتورة ${invoice_number}`, p.amount, 'الصندوق', 'purchase', purchaseId, user);
+        } else if (p.payment_type === 'تحويل' || p.payment_type === 'TPE') {
+          addTreasuryEntry(date, 'صادر', `مشتريات (${p.payment_type}) - فاتورة ${invoice_number}`, p.amount, 'البنك', 'purchase', purchaseId, user);
+        }
+
+        if (p.payment_type === 'شيك' || p.payment_type === 'شيك_مظهر') {
+          db.prepare(`INSERT INTO checks_issued (check_number, date, to_supplier, amount, due_date, bank, type, source_check_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(p.check_number, date, supplier_name, p.amount, p.check_due_date, p.bank, p.payment_type === 'شيك_مظهر' ? 'مظهّر' : 'شيكاتي', p.source_check_id || null);
+          if (p.source_check_id) {
+            db.prepare(`UPDATE checks_portfolio SET used_for_payment = 1, status = 'مظهّر', endorsed_to = ?, endorsed_date = ? WHERE id = ?`).run(supplier_name, date, p.source_check_id);
+          }
+        }
+      });
+
+      return { purchaseId, total_amount, applied_credit, status };
     });
-    logAudit('purchases', purchaseId, 'create', null, req.body, user || 'system');
-    res.status(201).json({ id: purchaseId, invoice_number, total_amount });
+
+    const result = createPurchase();
+    logAudit('purchases', result.purchaseId, 'create', null, req.body, user || 'system');
+    res.status(201).json({ id: result.purchaseId, invoice_number, total_amount: result.total_amount, applied_credit: result.applied_credit, status: result.status });
   } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Add payment to an existing purchase
+app.post('/api/purchases/:id/payment', (req, res) => {
+  try {
+    const purchaseId = parseInt(req.params.id);
+    const { payment_type, amount, check_number, check_date, check_due_date, bank, source_check_id, user } = req.body;
+
+    if (!amount || parseFloat(amount) <= 0) return res.status(400).json({ error: 'Invalid payment amount' });
+    if (!payment_type) return res.status(400).json({ error: 'Payment type is required' });
+
+    const payPurchase = db.transaction(() => {
+      const purchase = db.prepare('SELECT * FROM purchases WHERE id = ?').get(purchaseId);
+      if (!purchase) throw new Error('Purchase not found');
+
+      const payDate = new Date().toISOString().split('T')[0];
+
+      // Insert payment record
+      db.prepare(`
+        INSERT INTO purchases_payments (purchase_id, payment_type, amount, check_number, check_date, check_due_date, bank, source_check_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(purchaseId, payment_type, parseFloat(amount), check_number || null, check_date || null, check_due_date || null, bank || null, source_check_id || null);
+
+      // Treasury entry
+      if (payment_type === 'نقدي') {
+        addTreasuryEntry(payDate, 'صادر', `دفع مشتريات - فاتورة ${purchase.invoice_number}`, parseFloat(amount), 'الصندوق', 'purchase', purchaseId, user);
+      } else if (payment_type === 'تحويل' || payment_type === 'TPE') {
+        addTreasuryEntry(payDate, 'صادر', `دفع مشتريات (${payment_type}) - فاتورة ${purchase.invoice_number}`, parseFloat(amount), 'البنك', 'purchase', purchaseId, user);
+      }
+
+      if (payment_type === 'شيك' || payment_type === 'شيك_مظهر') {
+        db.prepare(`INSERT INTO checks_issued (check_number, date, to_supplier, amount, due_date, bank, type, source_check_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          check_number, payDate, purchase.supplier_name, parseFloat(amount), check_due_date, bank,
+          payment_type === 'شيك_مظهر' ? 'مظهّر' : 'شيكاتي', source_check_id || null
+        );
+        if (source_check_id) {
+          db.prepare(`UPDATE checks_portfolio SET used_for_payment = 1, status = 'مظهّر', endorsed_to = ?, endorsed_date = ? WHERE id = ?`).run(purchase.supplier_name, payDate, source_check_id);
+        }
+      }
+
+      // Recompute remaining and auto-update status (no negative stored)
+      const totalPaid = db.prepare(`SELECT COALESCE(SUM(amount), 0) as total FROM purchases_payments WHERE purchase_id = ?`).get(purchaseId).total;
+      const remaining = Math.max(0, purchase.total_amount - parseFloat(purchase.applied_credit || 0) - totalPaid);
+      const newStatus = remaining <= 0 ? 'CLOSED' : 'OPEN';
+
+      db.prepare(`UPDATE purchases SET status = ? WHERE id = ?`).run(newStatus, purchaseId);
+
+      return { total_paid: totalPaid, remaining, status: newStatus };
+    });
+
+    const result = payPurchase();
+    logAudit('purchases_payments', purchaseId, 'payment', null, req.body, user || 'system');
+    res.json({ success: true, purchase_id: purchaseId, ...result });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Dynamic supplier balance
+app.get('/api/suppliers/:id/balance', (req, res) => {
+  try {
+    const supplierId = parseInt(req.params.id);
+    const supplier = db.prepare('SELECT * FROM suppliers WHERE id = ?').get(supplierId);
+    if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
+
+    const totalInvoiced = db.prepare(`SELECT COALESCE(SUM(total_amount), 0) as total FROM purchases WHERE supplier_id = ?`).get(supplierId).total;
+    const totalPaid = db.prepare(`
+      SELECT COALESCE(SUM(pp.amount), 0) as total
+      FROM purchases_payments pp
+      INNER JOIN purchases pur ON pp.purchase_id = pur.id
+      WHERE pur.supplier_id = ?
+    `).get(supplierId).total;
+
+    const balance = totalInvoiced - totalPaid;  // positive = we owe, negative = supplier credit
+    const supplier_credit = balance < 0 ? Math.abs(balance) : 0;
+
+    res.json({
+      supplier_id: supplierId,
+      supplier_name: supplier.name,
+      total_invoiced: totalInvoiced,
+      total_paid: totalPaid,
+      balance,          // positive = we owe supplier, negative = supplier owes us
+      supplier_credit   // amount supplier owes us (available to apply to next invoice)
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ============================================
