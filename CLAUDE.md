@@ -137,6 +137,15 @@ No automated tests. Manual testing via:
 ## Currency
 
 All monetary values displayed in Moroccan Dirham (DH). Format: `X,XXX.XX DH`
+## Accounting Rules
+
+Every financial transaction must generate accounting impact.
+
+Sales -> Revenue + Cash/Receivable  
+Purchases -> Inventory + Payable  
+Manufacturing -> Raw material consumption + Finished goods production  
+
+Inventory movements must always be traceable.
 
 ## Language
 
