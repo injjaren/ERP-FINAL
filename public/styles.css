@@ -1,4 +1,4 @@
-* { margin: 0; padding: 0; box-sizing: border-box; }
+* { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Cairo', sans-serif; }
 
 :root {
   --primary: #2563eb; --primary-dark: #1e40af; --success: #10b981;
@@ -6,7 +6,7 @@
   --dark: #1f2937; --light: #f3f4f6; --white: #ffffff; --border: #e5e7eb;
 }
 
-body { font-family: 'Cairo', sans-serif; background: var(--light); color: var(--dark); }
+body { font-family: 'Cairo', sans-serif; background: var(--light); color: var(--dark); direction: rtl; text-align: right; }
 
 .app-container {
   display: grid; grid-template-areas: "header header" "sidebar main";

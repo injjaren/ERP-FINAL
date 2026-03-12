@@ -1,6 +1,12 @@
 FROM node:18-alpine
 
-RUN apk add --no-cache sqlite curl
+# Set UTF-8 locale so all system calls, SQLite I/O, and native modules
+# default to UTF-8. Required for correct Arabic text handling.
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV DOCKER=true
+
+RUN apk add --no-cache sqlite curl icu-data-full
 
 WORKDIR /app
 

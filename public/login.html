@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>تسجيل الدخول — نظام ERP</title>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Cairo', sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .login-card {
+      background: #fff;
+      border-radius: 16px;
+      padding: 48px 40px;
+      width: 100%;
+      max-width: 420px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+    }
+
+    .login-logo {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+
+    .login-logo h1 {
+      font-size: 1.6rem;
+      font-weight: 900;
+      color: #1a1a2e;
+      margin-top: 8px;
+    }
+
+    .login-logo p {
+      color: #888;
+      font-size: 0.9rem;
+      margin-top: 4px;
+    }
+
+    .form-group {
+      margin-bottom: 20px;
+    }
+
+    label {
+      display: block;
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 7px;
+      font-size: 0.95rem;
+    }
+
+    input, select {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1.5px solid #ddd;
+      border-radius: 8px;
+      font-family: 'Cairo', sans-serif;
+      font-size: 0.95rem;
+      color: #333;
+      transition: border-color 0.2s;
+      direction: rtl;
+      text-align: right;
+      background: #fff;
+    }
+
+    input:focus, select:focus {
+      outline: none;
+      border-color: #0f3460;
+      box-shadow: 0 0 0 3px rgba(15,52,96,0.12);
+    }
+
+    select {
+      cursor: pointer;
+      appearance: auto;
+    }
+
+    select option[value=""] {
+      color: #aaa;
+    }
+
+    .branch-icon {
+      display: inline-block;
+      margin-left: 6px;
+      font-size: 1rem;
+    }
+
+    .btn-login {
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #0f3460, #1a1a2e);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-family: 'Cairo', sans-serif;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      margin-top: 8px;
+      transition: opacity 0.2s, transform 0.1s;
+    }
+
+    .btn-login:hover  { opacity: 0.92; }
+    .btn-login:active { transform: scale(0.98); }
+    .btn-login:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .error-msg {
+      display: none;
+      background: #f8d7da;
+      color: #c0392b;
+      border: 1px solid #f5c6cb;
+      border-radius: 8px;
+      padding: 11px 14px;
+      font-size: 0.9rem;
+      margin-top: 16px;
+      text-align: center;
+    }
+
+    .error-msg.show { display: block; }
+
+    .loading-branches {
+      color: #888;
+      font-size: 0.85rem;
+      padding: 10px 0 4px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+<div class="login-card">
+  <div class="login-logo">
+    <div style="font-size:3rem">🏭</div>
+    <h1>نظام ERP محاسبي</h1>
+    <p>تسجيل الدخول للمتابعة</p>
+  </div>
+
+  <form id="login-form" autocomplete="off">
+    <div class="form-group">
+      <label for="username">اسم المستخدم</label>
+      <input type="text" id="username" name="username" placeholder="admin" required autocomplete="username">
+    </div>
+
+    <div class="form-group">
+      <label for="password">كلمة المرور</label>
+      <input type="password" id="password" name="password" placeholder="••••••••" required autocomplete="current-password">
+    </div>
+
+    <div class="form-group">
+      <label for="branch_id"><span class="branch-icon">🏢</span> الفرع</label>
+      <select id="branch_id" name="branch_id" required>
+        <option value="">⏳ جارٍ تحميل الفروع...</option>
+      </select>
+    </div>
+
+    <button type="submit" class="btn-login" id="submit-btn">🔐 دخول</button>
+
+    <div class="error-msg" id="error-msg"></div>
+  </form>
+</div>
+
+<script>
+  // If already logged in, go straight to app
+  fetch('/api/me').then(r => {
+    if (r.ok) window.location.replace('/');
+  }).catch(() => {});
+
+  // Load branches into dropdown
+  (async function loadBranches() {
+    const sel = document.getElementById('branch_id');
+    try {
+      const res = await fetch('/api/branches/public');
+      if (!res.ok) throw new Error('فشل تحميل الفروع');
+      const branches = await res.json();
+      if (!branches || branches.length === 0) {
+        sel.innerHTML = '<option value="">لا توجد فروع متاحة</option>';
+        return;
+      }
+      sel.innerHTML = '<option value="">— اختر الفرع —</option>' +
+        branches.map(b => `<option value="${b.id}">${b.name}</option>`).join('');
+    } catch (err) {
+      sel.innerHTML = '<option value="">⚠️ تعذّر تحميل الفروع</option>';
+      console.error('loadBranches:', err);
+    }
+  })();
+
+  document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn      = document.getElementById('submit-btn');
+    const errBox   = document.getElementById('error-msg');
+    const username = document.getElementById('username').value.trim();
+    const password = document.getElementById('password').value;
+    const branch_id = parseInt(document.getElementById('branch_id').value, 10);
+
+    errBox.classList.remove('show');
+
+    // Frontend validation: branch must be selected
+    if (!branch_id) {
+      errBox.textContent = 'يجب اختيار الفرع قبل تسجيل الدخول';
+      errBox.classList.add('show');
+      return;
+    }
+
+    btn.disabled    = true;
+    btn.textContent = '⏳ جارٍ التحقق...';
+
+    try {
+      const res  = await fetch('/api/login', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ username, password, branch_id })
+      });
+      const data = await res.json();
+
+      if (res.ok) {
+        window.location.replace('/');
+      } else {
+        errBox.textContent = data.error || 'فشل تسجيل الدخول';
+        errBox.classList.add('show');
+        btn.disabled    = false;
+        btn.textContent = '🔐 دخول';
+      }
+    } catch (err) {
+      errBox.textContent = 'تعذّر الاتصال بالخادم';
+      errBox.classList.add('show');
+      btn.disabled    = false;
+      btn.textContent = '🔐 دخول';
+    }
+  });
+</script>
+
+</body>
+</html>

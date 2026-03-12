@@ -6,6 +6,124 @@
   <title>نظام ERP محاسبي كامل</title>
   <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
+  <style>
+    /* ── Branch indicator & switch button in header ─────── */
+    .header-branch {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-family: 'Cairo', sans-serif;
+    }
+    .branch-badge {
+      background: rgba(255,255,255,0.15);
+      border: 1px solid rgba(255,255,255,0.25);
+      color: #fff;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .btn-switch-branch {
+      background: rgba(255,255,255,0.12);
+      border: 1px solid rgba(255,255,255,0.3);
+      color: #fff;
+      padding: 5px 12px;
+      border-radius: 8px;
+      font-family: 'Cairo', sans-serif;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+      white-space: nowrap;
+    }
+    .btn-switch-branch:hover {
+      background: rgba(255,255,255,0.25);
+    }
+
+    /* ── Branch switch modal overlay ────────────────────── */
+    #branch-switch-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.55);
+      z-index: 10000;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Cairo', sans-serif;
+    }
+    #branch-switch-modal.visible {
+      display: flex;
+    }
+    .bsm-card {
+      background: #fff;
+      border-radius: 14px;
+      width: 360px;
+      max-width: 92vw;
+      padding: 32px 28px 24px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+      direction: rtl;
+    }
+    .bsm-card h3 {
+      margin: 0 0 20px;
+      font-size: 1.1rem;
+      font-weight: 800;
+      color: #1a1a2e;
+    }
+    .bsm-card select {
+      width: 100%;
+      padding: 11px 13px;
+      border: 1.5px solid #ddd;
+      border-radius: 8px;
+      font-family: 'Cairo', sans-serif;
+      font-size: 0.95rem;
+      color: #333;
+      margin-bottom: 18px;
+      direction: rtl;
+      cursor: pointer;
+    }
+    .bsm-card select:focus {
+      outline: none;
+      border-color: #0f3460;
+    }
+    .bsm-actions {
+      display: flex;
+      gap: 10px;
+    }
+    .bsm-btn {
+      flex: 1;
+      padding: 11px;
+      border-radius: 8px;
+      border: none;
+      font-family: 'Cairo', sans-serif;
+      font-weight: 700;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .bsm-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .bsm-btn-confirm {
+      background: linear-gradient(135deg, #0f3460, #1a1a2e);
+      color: #fff;
+    }
+    .bsm-btn-cancel {
+      background: #f1f5f9;
+      color: #374151;
+    }
+    .bsm-error {
+      background: #fef2f2;
+      color: #c0392b;
+      border: 1px solid #fecaca;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 0.85rem;
+      margin-bottom: 14px;
+      display: none;
+    }
+    .bsm-error.show { display: block; }
+  </style>
 </head>
 <body>
 
@@ -16,23 +134,38 @@
       <div class="header-info">
         <span class="badge badge-success">🟢 متصل</span>
         <span id="currentUser">Admin</span>
+        <!-- Branch indicator -->
+        <div class="header-branch">
+          <span class="branch-badge" id="currentBranchBadge" style="display:none">
+            🏢 <span id="currentBranch">—</span>
+          </span>
+          <button class="btn-switch-branch" id="switchBranchBtn" onclick="openBranchSwitchModal()" style="display:none">
+            🔀 تغيير الفرع
+          </button>
+        </div>
       </div>
     </div>
   </header>
 
   <aside class="sidebar">
     <nav class="nav-menu">
-      <div class="nav-section">
+
+      <!-- ── ALWAYS VISIBLE ─────────────────────────────── -->
+      <div class="nav-section" data-branch="all">
         <h3>📊 الرئيسية</h3>
         <a href="#" class="nav-item active" data-page="dashboard">
           <span>📈</span> لوحة التحكم
         </a>
       </div>
 
-      <div class="nav-section">
-        <h3>🎨 الإعدادات الأساسية</h3>
-        <a href="#" class="nav-item" data-page="color-codes">
-          <span>🎨</span> أكواد الألوان
+      <!-- ── SETTINGS: Color system — wholesale + retail only ── -->
+      <div class="nav-section" data-branch="wholesale,retail">
+        <h3>🎨 الألوان والإعدادات</h3>
+        <a href="#" class="nav-item" data-page="color-management">
+          <span>🎨</span> إدارة الألوان
+        </a>
+        <a href="#" class="nav-item" data-page="color-analytics">
+          <span>📊</span> تقارير الألوان
         </a>
         <a href="#" class="nav-item" data-page="warehouses">
           <span>🏬</span> المخازن
@@ -45,33 +178,68 @@
         </a>
       </div>
 
-      <div class="nav-section">
+      <!-- ── SETTINGS (no color): supplies only ──────────── -->
+      <div class="nav-section" data-branch="supplies">
+        <h3>⚙️ الإعدادات</h3>
+        <a href="#" class="nav-item" data-page="warehouses">
+          <span>🏬</span> المخازن
+        </a>
+        <a href="#" class="nav-item" data-page="product-types">
+          <span>📦</span> أنواع المنتجات
+        </a>
+      </div>
+
+      <!-- ── INVENTORY: all branches ──────────────────────── -->
+      <div class="nav-section" data-branch="wholesale,retail,supplies">
         <h3>📦 المخزون</h3>
         <a href="#" class="nav-item" data-page="inventory">
           <span>📦</span> المخزون
         </a>
+        <a href="#" class="nav-item" data-page="inventory-reports">
+          <span>📊</span> تقارير المخزون
+        </a>
       </div>
 
-      <div class="nav-section">
-        <h3>🏭 التصنيع والإنتاج</h3>
-        <a href="#" class="nav-item" data-page="tdwar">
-          <span>🔄</span> نظام التدوير
+      <!-- ── MANUFACTURING: wholesale only ────────────────── -->
+      <div class="nav-section" id="mfg-nav-section" data-branch="wholesale">
+        <h3>🏭 التصنيع</h3>
+        <a href="#" class="nav-item" data-page="mfg-dashboard">
+          <span>📊</span> لوحة الإنتاج
+        </a>
+        <a href="#" class="nav-item" data-page="mfg-sessions">
+          <span>📋</span> جلسات الإنتاج
+        </a>
+        <a href="#" class="nav-item" data-page="mfg-colors-overview">
+          <span>🎨</span> مخزون الألوان
+        </a>
+        <a href="#" class="nav-item" data-page="mfg-session-new">
+          <span>➕</span> جلسة جديدة
         </a>
         <a href="#" class="nav-item" data-page="artisans">
-          <span>👨‍🔧</span> الصنّاع
+          <span>👨‍🔧</span> الحرفيون
         </a>
-        <a href="#" class="nav-item" data-page="artisan-dashboard">
-          <span>📊</span> أداء الصناع
+        <a href="#" class="nav-item" data-page="mfg-artisan-rates">
+          <span>💰</span> أسعار الحرفيين
+        </a>
+        <a href="#" class="nav-item" data-page="mfg-reports">
+          <span>📈</span> تقارير الإنتاج
+        </a>
+        <a href="#" class="nav-item" data-page="mfg-colors-below-zero">
+          <span>⚠️</span> ألوان بمخزون سالب
+        </a>
+        <a href="#" class="nav-item" data-page="mfg-batches">
+          <span>📦</span> الدُفعات القديمة
+        </a>
+        <a href="#" class="nav-item" data-page="mfg-cost-analysis">
+          <span>📊</span> تحليل التكلفة
         </a>
       </div>
 
-      <div class="nav-section">
-        <h3>💰 المبيعات والمشتريات</h3>
+      <!-- ── WHOLESALE: POS + Suppliers + Transfers ─────── -->
+      <div class="nav-section" data-branch="wholesale">
+        <h3>💰 البيع بالجملة</h3>
         <a href="#" class="nav-item" data-page="pos">
-          <span>🛒</span> نقطة البيع
-        </a>
-        <a href="#" class="nav-item" data-page="special-orders">
-          <span>📋</span> الطلبيات الخاصة
+          <span>🛒</span> نقطة البيع (الجملة)
         </a>
         <a href="#" class="nav-item" data-page="sales">
           <span>📤</span> المبيعات
@@ -79,19 +247,73 @@
         <a href="#" class="nav-item" data-page="purchases">
           <span>📥</span> المشتريات
         </a>
+        <a href="#" class="nav-item" data-page="suppliers">
+          <span>🏭</span> الموردين
+        </a>
+        <a href="#" class="nav-item" data-page="reports">
+          <span>🔀</span> التحويلات
+        </a>
       </div>
 
-      <div class="nav-section">
-        <h3>📝 الشيكات</h3>
+      <!-- ── RETAIL: POS + Tailoring + Clients ──────────── -->
+      <div class="nav-section" data-branch="retail">
+        <h3>🛒 التجزئة والخياطة</h3>
+        <a href="#" class="nav-item" data-page="pos">
+          <span>🛒</span> نقطة البيع (التجزئة)
+        </a>
+        <a href="#" class="nav-item" data-page="sales">
+          <span>📤</span> المبيعات
+        </a>
+        <a href="#" class="nav-item" data-page="clients">
+          <span>👥</span> العملاء
+        </a>
+        <a href="#" class="nav-item" data-page="tailoring-pos">
+          <span>🧵</span> نقطة بيع الخياطة
+        </a>
+        <a href="#" class="nav-item" data-page="tailoring-orders">
+          <span>📋</span> طلبات الخياطة
+        </a>
+        <a href="#" class="nav-item" data-page="tailoring-catalog">
+          <span>📖</span> كتالوج الخدمات
+        </a>
+        <a href="#" class="nav-item" data-page="tailoring-artisan-board">
+          <span>👨‍🎨</span> لوحة الحرفيين
+        </a>
+      </div>
+
+      <!-- ── SUPPLIES: POS + Clients + Suppliers ────────── -->
+      <div class="nav-section" data-branch="supplies">
+        <h3>🧺 لوازم الخياطة</h3>
+        <a href="#" class="nav-item" data-page="pos-supplies">
+          <span>🛍️</span> نقطة البيع
+        </a>
+        <a href="#" class="nav-item" data-page="clients">
+          <span>👥</span> العملاء
+        </a>
+        <a href="#" class="nav-item" data-page="purchases">
+          <span>📥</span> المشتريات
+        </a>
+        <a href="#" class="nav-item" data-page="suppliers">
+          <span>🏭</span> الموردين
+        </a>
+      </div>
+
+      <!-- ── CHECKS + TRAITES: wholesale + retail ────────── -->
+      <div class="nav-section" data-branch="wholesale,retail">
+        <h3>📝 الشيكات والكمبيالات</h3>
         <a href="#" class="nav-item" data-page="checks-portfolio">
           <span>💳</span> محفظة الشيكات
         </a>
         <a href="#" class="nav-item" data-page="checks-issued">
           <span>📄</span> الشيكات الصادرة
         </a>
+        <a href="#" class="nav-item" data-page="traites">
+          <span>📋</span> سندات الدين
+        </a>
       </div>
 
-      <div class="nav-section">
+      <!-- ── FINANCE: all branches ───────────────────────── -->
+      <div class="nav-section" data-branch="wholesale,retail,supplies">
         <h3>💵 المالية</h3>
         <a href="#" class="nav-item" data-page="treasury">
           <span>💰</span> الخزينة
@@ -99,20 +321,28 @@
         <a href="#" class="nav-item" data-page="expenses">
           <span>💸</span> المصروفات
         </a>
-        <a href="#" class="nav-item" data-page="clients">
-          <span>👥</span> العملاء
+      </div>
+
+      <!-- ── ACCOUNTING: all branches ────────────────────── -->
+      <div class="nav-section" data-branch="wholesale,retail,supplies">
+        <h3>📊 المحاسبة</h3>
+        <a href="#" class="nav-item" data-page="journal">
+          <span>📒</span> القيود المحاسبية
         </a>
-        <a href="#" class="nav-item" data-page="suppliers">
-          <span>🏭</span> الموردين
+        <a href="#" class="nav-item" data-page="trial-balance">
+          <span>📊</span> ميزان المراجعة
+        </a>
+        <a href="#" class="nav-item" data-page="ledger">
+          <span>📘</span> دفتر الأستاذ
+        </a>
+        <a href="#" class="nav-item" data-page="profit-loss">
+          <span>📊</span> قائمة الدخل
+        </a>
+        <a href="#" class="nav-item" data-page="balance-sheet">
+          <span>📊</span> الميزانية
         </a>
       </div>
 
-      <div class="nav-section">
-        <h3>📊 التقارير</h3>
-        <a href="#" class="nav-item" data-page="reports">
-          <span>📈</span> التقارير المالية
-        </a>
-      </div>
     </nav>
   </aside>
 
@@ -123,6 +353,160 @@
 
 <div id="modal-container"></div>
 
+<!-- ── Branch Switch Modal ─────────────────────────────────────────────── -->
+<div id="branch-switch-modal">
+  <div class="bsm-card">
+    <h3>🔀 تغيير الفرع</h3>
+    <div class="bsm-error" id="bsm-error"></div>
+    <select id="bsm-branch-select">
+      <option value="">⏳ جارٍ التحميل...</option>
+    </select>
+    <div class="bsm-actions">
+      <button class="bsm-btn bsm-btn-confirm" id="bsm-confirm-btn" onclick="confirmBranchSwitch()">✅ تأكيد</button>
+      <button class="bsm-btn bsm-btn-cancel" onclick="closeBranchSwitchModal()">إلغاء</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── Auth guard + header population ────────────────────────────────────────
+
+  // Apply branch-based nav isolation
+  // Sections with data-branch="all" are always visible.
+  // Sections without data-branch are hidden when a branch_type is known.
+  function applyBranchNav(branchType) {
+    document.querySelectorAll('.nav-section[data-branch]').forEach(function(section) {
+      if (section.dataset.branch === 'all') {
+        section.style.display = '';
+        return;
+      }
+      if (!branchType) {
+        // No branch_type known → show everything (fallback)
+        section.style.display = '';
+        return;
+      }
+      const allowed = section.dataset.branch.split(',').map(function(s) { return s.trim(); });
+      section.style.display = allowed.indexOf(branchType) !== -1 ? '' : 'none';
+    });
+  }
+
+  (async function authGuard() {
+    try {
+      const res = await fetch('/api/me');
+      if (!res.ok) {
+        window.location.replace('/login.html');
+        return;
+      }
+      const data = await res.json();
+      if (data.user) {
+        // Username display
+        const elUser = document.getElementById('currentUser');
+        if (elUser) elUser.textContent = data.user.username + ' (' + data.user.role + ')';
+
+        // Branch display
+        if (data.user.branch_id && data.user.branch_name) {
+          const elBranch  = document.getElementById('currentBranch');
+          const elBadge   = document.getElementById('currentBranchBadge');
+          const elSwitBtn = document.getElementById('switchBranchBtn');
+          if (elBranch)  elBranch.textContent = data.user.branch_name;
+          if (elBadge)   elBadge.style.display = 'flex';
+          if (elSwitBtn) elSwitBtn.style.display = 'inline-block';
+        }
+
+        // Store current branch globally for use by other scripts
+        window.CURRENT_BRANCH_ID   = data.user.branch_id   || null;
+        window.CURRENT_BRANCH_NAME = data.user.branch_name || null;
+        window.CURRENT_BRANCH_TYPE = data.user.branch_type || null;
+        window.CURRENT_USER        = data.user;
+
+        // Apply branch-based sidebar isolation
+        applyBranchNav(data.user.branch_type || null);
+      }
+    } catch (e) {
+      window.location.replace('/login.html');
+    }
+  })();
+
+  // ── Branch Switch Modal ──────────────────────────────────────────────────
+
+  async function openBranchSwitchModal() {
+    const modal  = document.getElementById('branch-switch-modal');
+    const sel    = document.getElementById('bsm-branch-select');
+    const errEl  = document.getElementById('bsm-error');
+    errEl.classList.remove('show');
+    errEl.textContent = '';
+    modal.classList.add('visible');
+
+    sel.innerHTML = '<option value="">⏳ جارٍ التحميل...</option>';
+    try {
+      const res = await fetch('/api/branches/public');
+      const branches = await res.json();
+      sel.innerHTML = '<option value="">— اختر الفرع —</option>' +
+        branches.map(b => {
+          const selected = b.id === window.CURRENT_BRANCH_ID ? ' selected' : '';
+          return `<option value="${b.id}"${selected}>${b.name}</option>`;
+        }).join('');
+    } catch (e) {
+      sel.innerHTML = '<option value="">⚠️ تعذّر تحميل الفروع</option>';
+    }
+  }
+
+  function closeBranchSwitchModal() {
+    document.getElementById('branch-switch-modal').classList.remove('visible');
+  }
+
+  // Close modal on backdrop click
+  document.getElementById('branch-switch-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeBranchSwitchModal();
+  });
+
+  async function confirmBranchSwitch() {
+    const sel    = document.getElementById('bsm-branch-select');
+    const errEl  = document.getElementById('bsm-error');
+    const btn    = document.getElementById('bsm-confirm-btn');
+    const branch_id = parseInt(sel.value, 10);
+
+    errEl.classList.remove('show');
+
+    if (!branch_id) {
+      errEl.textContent = 'يجب اختيار فرع.';
+      errEl.classList.add('show');
+      return;
+    }
+
+    if (branch_id === window.CURRENT_BRANCH_ID) {
+      closeBranchSwitchModal();
+      return;
+    }
+
+    btn.disabled    = true;
+    btn.textContent = '⏳ جارٍ التغيير...';
+
+    try {
+      const res = await fetch('/api/session/branch', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ branch_id })
+      });
+      const data = await res.json();
+
+      if (res.ok) {
+        // Reload to re-scope all data to the new branch
+        window.location.reload();
+      } else {
+        errEl.textContent = data.error || 'فشل تغيير الفرع';
+        errEl.classList.add('show');
+        btn.disabled    = false;
+        btn.textContent = '✅ تأكيد';
+      }
+    } catch (e) {
+      errEl.textContent = 'تعذّر الاتصال بالخادم';
+      errEl.classList.add('show');
+      btn.disabled    = false;
+      btn.textContent = '✅ تأكيد';
+    }
+  }
+</script>
 <script src="app.js"></script>
 </body>
 </html>
